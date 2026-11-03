@@ -1,0 +1,9 @@
+{
+    "torrent_dir_path": "torrents",
+    "download_dir": "downloads",
+    "torrent_map_path": "torrent_map.json",
+    "http_port": 54068,
+    "torrent_port": 49152,
+    "trusted_proxy_address": "10.10.0.1",
+    "max_used_space_mb": 196608
+}
