@@ -19,6 +19,7 @@
 
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
+#include <boost/beast/core/tcp_stream.hpp>
 #include <boost/beast/http.hpp>
 #include <cerrno>
 #include <cstdint>
@@ -43,6 +44,7 @@ using TorrentsMap = std::unordered_map<std::string, FileLocation>;
 using ActiveFiles = std::unordered_map<std::string, size_t>;
 using tcp = boost::asio::ip::tcp;
 namespace http = boost::beast::http;
+constexpr auto pieceWaitTimeout = std::chrono::hours(1);
 
 struct Config {
     std::filesystem::path torrentsDir;
@@ -523,7 +525,7 @@ void releaseFile(const std::string& name,
     }
 }
 
-bool streamFile(tcp::socket& socket, const std::filesystem::path& path,
+bool streamFile(boost::beast::tcp_stream& stream, const std::filesystem::path& path,
     std::int64_t fileSize, const std::string& fileName, lt::torrent_handle handle,
     std::int64_t fileOffset, std::int64_t pieceLength, std::int64_t& bytesSent)
 {
@@ -540,7 +542,8 @@ bool streamFile(tcp::socket& socket, const std::filesystem::path& path,
     boost::system::error_code error;
     bytesSent = 0;
     http::response_serializer<http::empty_body> serializer(response);
-    http::write_header(socket, serializer, error);
+    stream.expires_after(std::chrono::seconds(60));
+    http::write_header(stream, serializer, error);
     if (error)
         return false;
 
@@ -548,16 +551,17 @@ bool streamFile(tcp::socket& socket, const std::filesystem::path& path,
     std::vector<char> buffer(bufferSize);
     off_t offset = 0;
     int fd = -1;
+    auto pieceWaitStarted = std::chrono::steady_clock::now();
 
-    auto clientDisconnected = [&socket]() {
-        pollfd descriptor { socket.native_handle(), POLLIN | POLLERR | POLLHUP | POLLNVAL, 0 };
+    auto clientDisconnected = [&stream]() {
+        pollfd descriptor { stream.socket().native_handle(), POLLIN | POLLERR | POLLHUP | POLLNVAL, 0 };
         if (::poll(&descriptor, 1, 0) <= 0)
             return false;
         if (descriptor.revents & POLLNVAL)
             return true;
 
         char byte = 0;
-        const ssize_t bytesRead = ::recv(socket.native_handle(), &byte, 1,
+        const ssize_t bytesRead = ::recv(stream.socket().native_handle(), &byte, 1,
             MSG_PEEK | MSG_DONTWAIT);
         if (bytesRead == 0)
             return true;
@@ -581,9 +585,12 @@ bool streamFile(tcp::socket& socket, const std::filesystem::path& path,
         const auto absoluteOffset = fileOffset + offset;
         const auto piece = static_cast<lt::piece_index_t>(absoluteOffset / pieceLength);
         if (!handle.have_piece(piece)) {
+            if (std::chrono::steady_clock::now() - pieceWaitStarted >= pieceWaitTimeout)
+                break;
             std::this_thread::sleep_for(std::chrono::milliseconds(25));
             continue;
         }
+        pieceWaitStarted = std::chrono::steady_clock::now();
 
         const auto pieceOffset = absoluteOffset % pieceLength;
         size_t bytesToRead = static_cast<size_t>(std::min<off_t>(
@@ -598,7 +605,8 @@ bool streamFile(tcp::socket& socket, const std::filesystem::path& path,
         if (bytesRead < 0)
             break;
 
-        boost::asio::write(socket, boost::asio::buffer(buffer.data(), bytesRead), error);
+        stream.expires_after(std::chrono::seconds(60));
+        boost::asio::write(stream, boost::asio::buffer(buffer.data(), bytesRead), error);
         if (error)
             break;
         offset += bytesRead;
@@ -644,16 +652,18 @@ void handleHttpConnection(tcp::socket socket, TorrentsMap& torrentsMap,
     std::string client;
     std::string name;
     try {
+        boost::beast::tcp_stream stream(std::move(socket));
         boost::beast::flat_buffer buffer;
         http::request_parser<http::string_body> parser;
         parser.body_limit(8192);
         parser.header_limit(8192);
         boost::system::error_code error;
-        http::read(socket, buffer, parser, error);
+        stream.expires_after(std::chrono::seconds(30));
+        http::read(stream, buffer, parser, error);
         if (error)
             return;
         const auto& request = parser.get();
-        client = getClientAddress(socket, request);
+        client = getClientAddress(stream.socket(), request);
 
         if (request.method() != http::verb::get
             || request.target().substr(0, 6) != "/file/") {
@@ -661,7 +671,8 @@ void handleHttpConnection(tcp::socket socket, TorrentsMap& torrentsMap,
             addCorsHeaders(response);
             response.body() = "not found";
             response.prepare_payload();
-            http::write(socket, response, error);
+            stream.expires_after(std::chrono::seconds(60));
+            http::write(stream, response, error);
             return;
         }
 
@@ -677,7 +688,8 @@ void handleHttpConnection(tcp::socket socket, TorrentsMap& torrentsMap,
             addCorsHeaders(response);
             response.body() = "not found";
             response.prepare_payload();
-            http::write(socket, response, error);
+            stream.expires_after(std::chrono::seconds(60));
+            http::write(stream, response, error);
             return;
         }
         // Keep the file active until streaming finishes or the client disconnects
@@ -689,7 +701,8 @@ void handleHttpConnection(tcp::socket socket, TorrentsMap& torrentsMap,
         const auto& files = torrentFile->files();
         logEvent("INFO", "download_started", "client=" + client + " name=" + name + " bytes=" + std::to_string(fileSize));
         std::int64_t bytesSent = 0;
-        bool completed = streamFile(socket, path, fileSize, path.filename().string(), handle, files.file_offset(location.index), files.piece_length(), bytesSent);
+        bool completed = streamFile(stream, path, fileSize, path.filename().string(), handle,
+            files.file_offset(location.index), files.piece_length(), bytesSent);
         logEvent("INFO", completed ? "download_completed" : "download_cancelled",
             "client=" + client + " name=" + name + " bytes=" + std::to_string(bytesSent) + " expected=" + std::to_string(fileSize));
     } catch (const std::exception& error) {
@@ -711,7 +724,9 @@ void startHttpServer(TorrentsMap& torrentsMap, TorrentList& torrents,
     constexpr size_t workerCount = 64;
     std::mutex queueMutex;
     std::condition_variable queueReady;
+    std::condition_variable queueSpace;
     std::queue<tcp::socket> pending;
+    constexpr size_t queueCapacity = 256;
     bool stopping = false;
     ActiveFiles activeFiles;
     std::mutex activationMutex;
@@ -724,6 +739,7 @@ void startHttpServer(TorrentsMap& torrentsMap, TorrentList& torrents,
                 return;
             tcp::socket socket = std::move(pending.front());
             pending.pop();
+            queueSpace.notify_one();
             lock.unlock();
 
             handleHttpConnection(std::move(socket), torrentsMap, torrents,
@@ -741,8 +757,14 @@ void startHttpServer(TorrentsMap& torrentsMap, TorrentList& torrents,
             tcp::socket socket(context);
             acceptor.accept(socket);
 
-            std::lock_guard<std::mutex> lock(queueMutex);
+            std::unique_lock<std::mutex> lock(queueMutex);
+            queueSpace.wait(lock, [&]() {
+                return stopping || pending.size() < queueCapacity;
+            });
+            if (stopping)
+                break;
             pending.push(std::move(socket));
+            lock.unlock();
             queueReady.notify_one();
         }
     } catch (const std::exception& error) {
