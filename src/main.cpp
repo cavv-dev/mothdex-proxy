@@ -54,11 +54,11 @@ using ActiveFiles = std::unordered_map<std::string, size_t>;
 using tcp = boost::asio::ip::tcp;
 namespace http = boost::beast::http;
 constexpr auto pieceWaitTimeout = std::chrono::minutes(15);
+const std::filesystem::path torrentsDir { "torrents" };
+const std::filesystem::path downloadDir { "downloads" };
+const std::filesystem::path torrentMapPath { "torrent_map.json" };
 
 struct Config {
-    std::filesystem::path torrentsDir;
-    std::filesystem::path downloadDir;
-    std::filesystem::path torrentMapPath;
     unsigned short httpPort;
     unsigned short torrentPort;
     std::string trustedProxyAddress;
@@ -98,16 +98,13 @@ Config loadConfig()
         throw std::runtime_error("invalid config file: top level is not an object");
 
     const char* required[] = {
-        "torrent_dir_path", "download_dir", "torrent_map_path",
         "http_port", "torrent_port", "trusted_proxy_address", "max_used_space_mb"
     };
     for (const char* key : required) {
         if (!root.isMember(key))
             throw std::runtime_error("invalid config file: missing " + std::string(key));
     }
-    if (!root["torrent_dir_path"].isString() || !root["download_dir"].isString()
-        || !root["torrent_map_path"].isString()
-        || !root["trusted_proxy_address"].isString()
+    if (!root["trusted_proxy_address"].isString()
         || !root["http_port"].isUInt() || !root["torrent_port"].isUInt()
         || !root["max_used_space_mb"].isUInt64())
         throw std::runtime_error("invalid config file: incorrect value type");
@@ -125,9 +122,6 @@ Config loadConfig()
         throw std::runtime_error("invalid config file: trusted_proxy_address is not an IP address");
 
     return {
-        root["torrent_dir_path"].asString(),
-        root["download_dir"].asString(),
-        root["torrent_map_path"].asString(),
         static_cast<unsigned short>(httpPort),
         static_cast<unsigned short>(torrentPort),
         root["trusted_proxy_address"].asString(),
@@ -137,8 +131,8 @@ Config loadConfig()
 
 void initializeStorage()
 {
-    std::filesystem::create_directories(config.torrentsDir);
-    std::filesystem::create_directories(config.downloadDir);
+    std::filesystem::create_directories(torrentsDir);
+    std::filesystem::create_directories(downloadDir);
 }
 
 lt::torrent_handle getTorrentHandle(TorrentList& torrents, const lt::sha1_hash& infoHash)
@@ -158,9 +152,9 @@ lt::torrent_handle getTorrentHandle(TorrentList& torrents, const lt::sha1_hash& 
 
 bool loadTorrentsMap(TorrentsMap& map)
 {
-    std::ifstream file(config.torrentMapPath, std::ios::binary);
+    std::ifstream file(torrentMapPath, std::ios::binary);
     if (!file.is_open()) {
-        logEvent("INFO", "torrent_map_missing", "path=" + config.torrentMapPath.string());
+        logEvent("INFO", "torrent_map_missing", "path=" + torrentMapPath.string());
         return false;
     }
 
@@ -248,7 +242,7 @@ lt::torrent_handle addTorrent(lt::session& s,
 {
     lt::add_torrent_params atp;
     atp.ti = ti;
-    atp.save_path = config.downloadDir;
+    atp.save_path = downloadDir;
     atp.storage_mode = lt::storage_mode_sparse;
     atp.flags |= lt::torrent_flags::paused;
     atp.flags &= ~lt::torrent_flags::auto_managed;
@@ -260,7 +254,7 @@ lt::torrent_handle addTorrent(lt::session& s,
 
 void loadTorrents(TorrentList& torrents, lt::session& s)
 {
-    for (const auto& entry : std::filesystem::directory_iterator(config.torrentsDir)) {
+    for (const auto& entry : std::filesystem::directory_iterator(torrentsDir)) {
         if (!entry.is_regular_file())
             continue;
 
@@ -485,7 +479,7 @@ bool getFileDetails(TorrentsMap& torrentsMap, TorrentList& torrents,
     handle.force_dht_announce();
     handle.force_reannounce();
 
-    path = files.file_path(location.index, config.downloadDir);
+    path = files.file_path(location.index, downloadDir);
     size = fileSize;
     download = { path, fileSize, handle, fileOffset, pieceLength };
     return true;

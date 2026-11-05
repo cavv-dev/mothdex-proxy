@@ -52,5 +52,3 @@ Before running it, the project directory must contain:
 - `torrent_map.json`, generated when building the Mothdex database in the [`mothdex-db`](https://github.com/cavv-dev/mothdex-db) repository.
 - The `.torrent` files in `torrents/`.
 - The `downloads/` directory, with enough storage for cached files.
-
-The paths in `config.json` must match the locations of these files and directories.
