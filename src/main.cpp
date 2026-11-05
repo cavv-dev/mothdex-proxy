@@ -39,12 +39,21 @@ struct TorrentEntry {
     libtorrent::torrent_handle handle;
     std::shared_ptr<libtorrent::torrent_info> info;
 };
+
+struct ActiveDownload {
+    std::filesystem::path path;
+    std::int64_t size;
+    lt::torrent_handle handle;
+    std::int64_t fileOffset;
+    std::int64_t pieceLength;
+};
+
 using TorrentList = std::vector<TorrentEntry>;
 using TorrentsMap = std::unordered_map<std::string, FileLocation>;
 using ActiveFiles = std::unordered_map<std::string, size_t>;
 using tcp = boost::asio::ip::tcp;
 namespace http = boost::beast::http;
-constexpr auto pieceWaitTimeout = std::chrono::hours(1);
+constexpr auto pieceWaitTimeout = std::chrono::minutes(15);
 
 struct Config {
     std::filesystem::path torrentsDir;
@@ -208,12 +217,21 @@ void initSettingsPack(lt::settings_pack& sp)
     sp.set_int(lt::settings_pack::disk_io_write_mode, lt::settings_pack::enable_os_cache);
     sp.set_int(lt::settings_pack::disk_io_read_mode, lt::settings_pack::enable_os_cache);
     sp.set_int(lt::settings_pack::suggest_mode, lt::settings_pack::no_piece_suggestions);
-    sp.set_int(lt::settings_pack::aio_threads, 2);
+    sp.set_bool(lt::settings_pack::prioritize_partial_pieces, true);
+    sp.set_int(lt::settings_pack::aio_threads, 4);
     sp.set_int(lt::settings_pack::cache_size, 64 * 1024);
     sp.set_int(lt::settings_pack::max_queued_disk_bytes, 16 * 1024 * 1024);
     sp.set_int(lt::settings_pack::connections_limit, 1024);
     sp.set_int(lt::settings_pack::active_downloads, -1);
     sp.set_int(lt::settings_pack::active_seeds, 0);
+    sp.set_int(lt::settings_pack::active_dht_limit, -1);
+    sp.set_bool(lt::settings_pack::announce_to_all_tiers, true);
+    sp.set_bool(lt::settings_pack::announce_to_all_trackers, true);
+    sp.set_int(lt::settings_pack::tracker_completion_timeout, 10);
+    sp.set_int(lt::settings_pack::tracker_receive_timeout, 5);
+    sp.set_int(lt::settings_pack::peer_connect_timeout, 5);
+    sp.set_int(lt::settings_pack::handshake_timeout, 5);
+    sp.set_int(lt::settings_pack::connection_speed, 100);
     sp.set_int(lt::settings_pack::active_checking, 4);
     sp.set_int(lt::settings_pack::listen_queue_size, 1024);
     sp.set_int(lt::settings_pack::choking_algorithm, lt::settings_pack::fixed_slots_choker);
@@ -418,8 +436,9 @@ bool makeRoom(std::uint64_t requiredBytes, const lt::sha1_hash& requestedHash,
 bool getFileDetails(TorrentsMap& torrentsMap, TorrentList& torrents,
     const std::string& name, std::filesystem::path& path, std::int64_t& size,
     ActiveFiles& activeFiles,
-    std::mutex& activationMutex, lt::session& session)
+    std::mutex& activationMutex, lt::session& session, ActiveDownload& download)
 {
+    std::lock_guard<std::mutex> lock(activationMutex);
     auto it = torrentsMap.find(name);
     if (it == torrentsMap.end())
         return false;
@@ -446,7 +465,6 @@ bool getFileDetails(TorrentsMap& torrentsMap, TorrentList& torrents,
         return false;
 
     const bool complete = fileIsComplete(handle, files, location.index);
-    std::lock_guard<std::mutex> lock(activationMutex);
     if (!complete && !makeRoom(static_cast<std::uint64_t>(fileSize), location.hash, torrentsMap, torrents, activeFiles, session))
         return false;
     // Remove priorities only when no one is downloading
@@ -456,7 +474,7 @@ bool getFileDetails(TorrentsMap& torrentsMap, TorrentList& torrents,
         const auto firstPiece = static_cast<lt::piece_index_t>(fileOffset / pieceLength);
         const auto lastPiece = static_cast<lt::piece_index_t>(
             (fileOffset + fileSize - 1) / pieceLength);
-        int deadline = 100;
+        int deadline = 0;
         for (auto piece = firstPiece; piece <= lastPiece; ++piece) {
             handle.piece_priority(piece, lt::default_priority);
             handle.set_piece_deadline(piece, deadline);
@@ -464,9 +482,12 @@ bool getFileDetails(TorrentsMap& torrentsMap, TorrentList& torrents,
         }
     }
     handle.resume();
+    handle.force_dht_announce();
+    handle.force_reannounce();
 
     path = files.file_path(location.index, config.downloadDir);
     size = fileSize;
+    download = { path, fileSize, handle, fileOffset, pieceLength };
     return true;
 }
 
@@ -521,6 +542,8 @@ void releaseFile(const std::string& name,
                         handle.piece_priority(piece, lt::default_priority);
                 }
             }
+            if (!torrentHasActiveFile(location.hash, torrentsMap, activeFiles))
+                handle.pause();
         }
     }
 }
@@ -577,7 +600,7 @@ bool streamFile(boost::beast::tcp_stream& stream, const std::filesystem::path& p
         if (fd == -1) {
             fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
             if (fd == -1) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 continue;
             }
         }
@@ -587,7 +610,7 @@ bool streamFile(boost::beast::tcp_stream& stream, const std::filesystem::path& p
         if (!handle.have_piece(piece)) {
             if (std::chrono::steady_clock::now() - pieceWaitStarted >= pieceWaitTimeout)
                 break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
         pieceWaitStarted = std::chrono::steady_clock::now();
@@ -681,9 +704,10 @@ void handleHttpConnection(tcp::socket socket, TorrentsMap& torrentsMap,
         name = urlDecode(target);
         std::filesystem::path path;
         std::int64_t fileSize = 0;
+        ActiveDownload download { };
         if (name.empty() || name.find('?') != std::string::npos
             || !getFileDetails(torrentsMap, torrents, name, path, fileSize, activeFiles,
-                activationMutex, session)) {
+                activationMutex, session, download)) {
             http::response<http::string_body> response { http::status::not_found, 11 };
             addCorsHeaders(response);
             response.body() = "not found";
@@ -695,14 +719,11 @@ void handleHttpConnection(tcp::socket socket, TorrentsMap& torrentsMap,
         // Keep the file active until streaming finishes or the client disconnects
         fileSlot = true;
 
-        const auto& location = torrentsMap.at(name);
-        auto handle = getTorrentHandle(torrents, location.hash);
-        auto torrentFile = handle.torrent_file();
-        const auto& files = torrentFile->files();
         logEvent("INFO", "download_started", "client=" + client + " name=" + name + " bytes=" + std::to_string(fileSize));
         std::int64_t bytesSent = 0;
-        bool completed = streamFile(stream, path, fileSize, path.filename().string(), handle,
-            files.file_offset(location.index), files.piece_length(), bytesSent);
+        bool completed = streamFile(stream, download.path, download.size,
+            download.path.filename().string(), download.handle,
+            download.fileOffset, download.pieceLength, bytesSent);
         logEvent("INFO", completed ? "download_completed" : "download_cancelled",
             "client=" + client + " name=" + name + " bytes=" + std::to_string(bytesSent) + " expected=" + std::to_string(fileSize));
     } catch (const std::exception& error) {
@@ -815,10 +836,17 @@ int main(void)
         startTorrentWorker(s, shuttingDown);
     });
 
-    startHttpServer(torrentsMap, torrents, shuttingDown, s);
+    int result = 0;
+    try {
+        startHttpServer(torrentsMap, torrents, shuttingDown, s);
+    } catch (const std::exception& error) {
+        logEvent("ERROR", "http_server_start_failed", error.what());
+        shuttingDown = true;
+        result = 1;
+    }
     torrentWorkerThread.join();
 
     logEvent("INFO", "server_stopped");
 
-    return 0;
+    return result;
 }
