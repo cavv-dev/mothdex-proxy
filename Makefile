@@ -2,9 +2,12 @@ CXX      = g++
 
 MINIMAL_FLAGS = -DTORRENT_DISABLE_SUPERSEEDING -DTORRENT_DISABLE_MUTABLE_TORRENTS
 
+SANITIZE ?=
+THREAD_SAFETY_FLAGS = $(if $(findstring clang,$(CXX)),-Wthread-safety,)
+
 LIBTORRENT_CFLAGS = $(shell pkg-config --cflags libtorrent-rasterbar)
 
-CXXFLAGS = -Wall -Wextra -std=c++17 -O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE $(MINIMAL_FLAGS) $(LIBTORRENT_CFLAGS) -I/usr/local/include -I/usr/include/jsoncpp
+CXXFLAGS = -Wall -Wextra -Wconversion -Wsign-conversion -std=c++17 -O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE $(MINIMAL_FLAGS) $(SANITIZE) $(THREAD_SAFETY_FLAGS) $(LIBTORRENT_CFLAGS) -I/usr/local/include -I/usr/include/jsoncpp
 
 LDFLAGS  = -L/usr/local/lib -pie -Wl,-z,relro,-z,now \
            -Wl,-Bstatic \
@@ -12,7 +15,8 @@ LDFLAGS  = -L/usr/local/lib -pie -Wl,-z,relro,-z,now \
            -ljsoncpp -lssl -lcrypto -lzstd -lz \
            -Wl,-Bdynamic \
            -lpthread -ldl -lm -lc \
-           -static-libgcc -static-libstdc++
+           -static-libgcc -static-libstdc++ \
+           $(SANITIZE)
 
 SRC_DIR  = src
 OBJ_DIR  = obj

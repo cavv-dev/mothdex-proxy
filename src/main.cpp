@@ -188,12 +188,14 @@ bool loadTorrentsMap(TorrentsMap& map)
     return true;
 }
 
-bool startDownloadByName(TorrentsMap& torrentsMap, TorrentList& torrents, const std::string& name)
+bool startDownloadByName(TorrentsMap& torrentsMap, TorrentList& torrents,
+    std::mutex& activationMutex, const std::string& name)
 {
     auto it = torrentsMap.find(name);
     if (it == torrentsMap.end())
         return false;
 
+    std::lock_guard<std::mutex> lock(activationMutex);
     const auto& loc = it->second;
 
     lt::torrent_handle handle = getTorrentHandle(torrents, loc.hash);
@@ -389,8 +391,14 @@ bool makeRoom(std::uint64_t requiredBytes, const lt::sha1_hash& requestedHash,
         if (!torrent.handle.is_valid())
             continue;
         const auto done = torrent.handle.status().total_done;
-        if (done > 0)
-            used += static_cast<std::uint64_t>(done);
+        if (done > 0) {
+            const auto doneBytes = static_cast<std::uint64_t>(done);
+            if (doneBytes >= limit || used > limit - doneBytes) {
+                used = limit;
+                break;
+            }
+            used += doneBytes;
+        }
     }
 
     // Evict whole inactive torrents so the requested file has room to download
@@ -436,6 +444,7 @@ bool getFileDetails(TorrentsMap& torrentsMap, TorrentList& torrents,
     if (it == torrentsMap.end())
         return false;
 
+    std::lock_guard<std::mutex> lock(activationMutex);
     const auto& location = it->second;
     lt::torrent_handle handle = getTorrentHandle(torrents, location.hash);
     if (!handle.is_valid())
@@ -458,13 +467,14 @@ bool getFileDetails(TorrentsMap& torrentsMap, TorrentList& torrents,
         return false;
 
     const bool complete = fileIsComplete(handle, files, location.index);
-    {
-        std::lock_guard<std::mutex> lock(activationMutex);
-        if (!complete && !makeRoom(static_cast<std::uint64_t>(fileSize), location.hash, torrentsMap, torrents, activeFiles, session))
-            return false;
+    if (!complete && !makeRoom(static_cast<std::uint64_t>(fileSize), location.hash, torrentsMap, torrents, activeFiles, session))
+        return false;
 
+    bool activeSlot = false;
+    try {
         // Remove priorities only when no one is downloading
         const bool activate = activeFiles[name]++ == 0;
+        activeSlot = true;
         if (activate) {
             handle.file_priority(location.index, lt::default_priority);
             const auto firstPiece = static_cast<lt::piece_index_t>(fileOffset / pieceLength);
@@ -478,11 +488,20 @@ bool getFileDetails(TorrentsMap& torrentsMap, TorrentList& torrents,
             }
         }
         handle.resume();
-    }
 
-    path = files.file_path(location.index, downloadDir);
-    size = fileSize;
-    download = { path, fileSize, handle, fileOffset, pieceLength };
+        path = files.file_path(location.index, downloadDir);
+        size = fileSize;
+        download = { path, fileSize, handle, fileOffset, pieceLength };
+    } catch (...) {
+        if (activeSlot) {
+            auto active = activeFiles.find(name);
+            if (active != activeFiles.end()) {
+                if (--active->second == 0)
+                    activeFiles.erase(active);
+            }
+        }
+        throw;
+    }
     return true;
 }
 
@@ -724,8 +743,15 @@ void handleHttpConnection(tcp::socket socket, TorrentsMap& torrentsMap,
     } catch (const std::exception& error) {
         logEvent("ERROR", "http_connection_error", "client=" + client + " reason=" + error.what());
     }
-    if (fileSlot)
-        releaseFile(name, torrentsMap, torrents, activeFiles, activationMutex);
+    if (fileSlot) {
+        try {
+            releaseFile(name, torrentsMap, torrents, activeFiles, activationMutex);
+        } catch (const std::exception& error) {
+            logEvent("ERROR", "file_release_failed", "name=" + name + " reason=" + error.what());
+        } catch (...) {
+            logEvent("ERROR", "file_release_failed", "name=" + name + " reason=unknown");
+        }
+    }
 }
 
 void startHttpServer(TorrentsMap& torrentsMap, TorrentList& torrents,
@@ -758,8 +784,14 @@ void startHttpServer(TorrentsMap& torrentsMap, TorrentList& torrents,
             queueSpace.notify_one();
             lock.unlock();
 
-            handleHttpConnection(std::move(socket), torrentsMap, torrents,
-                activeFiles, activationMutex, session);
+            try {
+                handleHttpConnection(std::move(socket), torrentsMap, torrents,
+                    activeFiles, activationMutex, session);
+            } catch (const std::exception& error) {
+                logEvent("ERROR", "http_worker_error", error.what());
+            } catch (...) {
+                logEvent("ERROR", "http_worker_error", "reason=unknown");
+            }
         }
     };
 
@@ -825,7 +857,15 @@ int main(void)
     std::atomic_bool shuttingDown { false };
 
     TorrentList torrents;
-    loadTorrents(torrents, s);
+    try {
+        loadTorrents(torrents, s);
+    } catch (const std::exception& error) {
+        logEvent("ERROR", "torrent_load_failed", error.what());
+        return 1;
+    } catch (...) {
+        logEvent("ERROR", "torrent_load_failed", "reason=unknown");
+        return 1;
+    }
 
     std::thread torrentWorkerThread([&s, &shuttingDown]() {
         startTorrentWorker(s, shuttingDown);
