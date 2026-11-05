@@ -432,7 +432,6 @@ bool getFileDetails(TorrentsMap& torrentsMap, TorrentList& torrents,
     ActiveFiles& activeFiles,
     std::mutex& activationMutex, lt::session& session, ActiveDownload& download)
 {
-    std::lock_guard<std::mutex> lock(activationMutex);
     auto it = torrentsMap.find(name);
     if (it == torrentsMap.end())
         return false;
@@ -459,25 +458,27 @@ bool getFileDetails(TorrentsMap& torrentsMap, TorrentList& torrents,
         return false;
 
     const bool complete = fileIsComplete(handle, files, location.index);
-    if (!complete && !makeRoom(static_cast<std::uint64_t>(fileSize), location.hash, torrentsMap, torrents, activeFiles, session))
-        return false;
-    // Remove priorities only when no one is downloading
-    bool activate = activeFiles[name]++ == 0;
-    if (activate) {
-        handle.file_priority(location.index, lt::default_priority);
-        const auto firstPiece = static_cast<lt::piece_index_t>(fileOffset / pieceLength);
-        const auto lastPiece = static_cast<lt::piece_index_t>(
-            (fileOffset + fileSize - 1) / pieceLength);
-        int deadline = 0;
-        for (auto piece = firstPiece; piece <= lastPiece; ++piece) {
-            handle.piece_priority(piece, lt::default_priority);
-            handle.set_piece_deadline(piece, deadline);
-            deadline = std::min(deadline + 25, 60000);
+    {
+        std::lock_guard<std::mutex> lock(activationMutex);
+        if (!complete && !makeRoom(static_cast<std::uint64_t>(fileSize), location.hash, torrentsMap, torrents, activeFiles, session))
+            return false;
+
+        // Remove priorities only when no one is downloading
+        const bool activate = activeFiles[name]++ == 0;
+        if (activate) {
+            handle.file_priority(location.index, lt::default_priority);
+            const auto firstPiece = static_cast<lt::piece_index_t>(fileOffset / pieceLength);
+            const auto lastPiece = static_cast<lt::piece_index_t>(
+                (fileOffset + fileSize - 1) / pieceLength);
+            int deadline = 0;
+            for (auto piece = firstPiece; piece <= lastPiece; ++piece) {
+                handle.piece_priority(piece, lt::default_priority);
+                handle.set_piece_deadline(piece, deadline);
+                deadline = std::min(deadline + 25, 60000);
+            }
         }
+        handle.resume();
     }
-    handle.resume();
-    handle.force_dht_announce();
-    handle.force_reannounce();
 
     path = files.file_path(location.index, downloadDir);
     size = fileSize;
@@ -591,6 +592,8 @@ bool streamFile(boost::beast::tcp_stream& stream, const std::filesystem::path& p
     while (offset < fileSize) {
         if (clientDisconnected())
             break;
+        if (std::chrono::steady_clock::now() - pieceWaitStarted >= pieceWaitTimeout)
+            break;
         if (fd == -1) {
             fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
             if (fd == -1) {
@@ -602,8 +605,6 @@ bool streamFile(boost::beast::tcp_stream& stream, const std::filesystem::path& p
         const auto absoluteOffset = fileOffset + offset;
         const auto piece = static_cast<lt::piece_index_t>(absoluteOffset / pieceLength);
         if (!handle.have_piece(piece)) {
-            if (std::chrono::steady_clock::now() - pieceWaitStarted >= pieceWaitTimeout)
-                break;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
