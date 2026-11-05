@@ -250,7 +250,7 @@ lt::torrent_handle addTorrent(lt::session& s,
     atp.flags &= ~lt::torrent_flags::auto_managed;
     atp.max_connections = 96;
     atp.max_uploads = 8;
-    atp.file_priorities.assign(ti->num_files(), lt::dont_download);
+    atp.file_priorities.assign(static_cast<std::size_t>(ti->num_files()), lt::dont_download);
     return s.add_torrent(std::move(atp));
 }
 
@@ -277,7 +277,7 @@ void loadTorrents(TorrentList& torrents, lt::session& s)
         std::shared_ptr<lt::torrent_info> ti;
         try {
             ti = std::make_shared<lt::torrent_info>(
-                lt::span<char const>(buffer.data(), buffer.size()), lt::from_span);
+                lt::span<char const>(buffer.data(), static_cast<std::ptrdiff_t>(buffer.size())), lt::from_span);
         } catch (const std::exception& error) {
             logEvent("ERROR", "torrent_skipped",
                 "path=" + entry.path().string() + " reason=" + error.what());
@@ -356,10 +356,10 @@ bool fileIsComplete(const lt::torrent_handle& handle, const lt::file_storage& fi
     const auto fileSize = files.file_size(index);
     if (fileSize <= 0)
         return false;
-    const auto firstPiece = static_cast<lt::piece_index_t>(
-        files.file_offset(index) / files.piece_length());
-    const auto lastPiece = static_cast<lt::piece_index_t>(
-        (files.file_offset(index) + fileSize - 1) / files.piece_length());
+    const auto firstPiece = static_cast<lt::piece_index_t>(static_cast<int>(
+        files.file_offset(index) / files.piece_length()));
+    const auto lastPiece = static_cast<lt::piece_index_t>(static_cast<int>(
+        (files.file_offset(index) + fileSize - 1) / files.piece_length()));
     for (auto piece = firstPiece; piece <= lastPiece; ++piece) {
         if (!handle.have_piece(piece))
             return false;
@@ -477,9 +477,10 @@ bool getFileDetails(TorrentsMap& torrentsMap, TorrentList& torrents,
         activeSlot = true;
         if (activate) {
             handle.file_priority(location.index, lt::default_priority);
-            const auto firstPiece = static_cast<lt::piece_index_t>(fileOffset / pieceLength);
-            const auto lastPiece = static_cast<lt::piece_index_t>(
-                (fileOffset + fileSize - 1) / pieceLength);
+            const auto firstPiece = static_cast<lt::piece_index_t>(static_cast<int>(
+                fileOffset / pieceLength));
+            const auto lastPiece = static_cast<lt::piece_index_t>(static_cast<int>(
+                (fileOffset + fileSize - 1) / pieceLength));
             int deadline = 0;
             for (auto piece = firstPiece; piece <= lastPiece; ++piece) {
                 handle.piece_priority(piece, lt::default_priority);
@@ -530,11 +531,11 @@ void releaseFile(const std::string& name,
             const auto& files = torrentFile->files();
             handle.file_priority(location.index, lt::dont_download);
             logEvent("INFO", "download_deactivated", "name=" + name + " reason=file_released");
-            const auto firstPiece = static_cast<lt::piece_index_t>(
-                files.file_offset(location.index) / files.piece_length());
-            const auto lastPiece = static_cast<lt::piece_index_t>(
+            const auto firstPiece = static_cast<lt::piece_index_t>(static_cast<int>(
+                files.file_offset(location.index) / files.piece_length()));
+            const auto lastPiece = static_cast<lt::piece_index_t>(static_cast<int>(
                 (files.file_offset(location.index) + files.file_size(location.index) - 1)
-                / files.piece_length());
+                / files.piece_length()));
             for (auto piece = firstPiece; piece <= lastPiece; ++piece)
                 handle.reset_piece_deadline(piece);
 
@@ -547,11 +548,11 @@ void releaseFile(const std::string& name,
                 if (other->second.hash == location.hash) {
                     const auto otherIndex = other->second.index;
                     handle.file_priority(otherIndex, lt::default_priority);
-                    const auto otherFirst = static_cast<lt::piece_index_t>(
-                        files.file_offset(otherIndex) / files.piece_length());
-                    const auto otherLast = static_cast<lt::piece_index_t>(
+                    const auto otherFirst = static_cast<lt::piece_index_t>(static_cast<int>(
+                        files.file_offset(otherIndex) / files.piece_length()));
+                    const auto otherLast = static_cast<lt::piece_index_t>(static_cast<int>(
                         (files.file_offset(otherIndex) + files.file_size(otherIndex) - 1)
-                        / files.piece_length());
+                        / files.piece_length()));
                     for (auto piece = otherFirst; piece <= otherLast; ++piece)
                         handle.piece_priority(piece, lt::default_priority);
                 }
@@ -622,7 +623,8 @@ bool streamFile(boost::beast::tcp_stream& stream, const std::filesystem::path& p
         }
 
         const auto absoluteOffset = fileOffset + offset;
-        const auto piece = static_cast<lt::piece_index_t>(absoluteOffset / pieceLength);
+        const auto piece = static_cast<lt::piece_index_t>(static_cast<int>(
+            absoluteOffset / pieceLength));
         if (!handle.have_piece(piece)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
@@ -643,7 +645,7 @@ bool streamFile(boost::beast::tcp_stream& stream, const std::filesystem::path& p
             break;
 
         stream.expires_after(std::chrono::seconds(60));
-        boost::asio::write(stream, boost::asio::buffer(buffer.data(), bytesRead), error);
+        boost::asio::write(stream, boost::asio::buffer(buffer.data(), static_cast<std::size_t>(bytesRead)), error);
         if (error)
             break;
         offset += bytesRead;
